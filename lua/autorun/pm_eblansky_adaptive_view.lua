@@ -35,21 +35,17 @@ if SERVER then
         PrintMessage(HUD_PRINTTALK, message)
     end, "pm_eblansky_adaptive_view_alladmins_notice")
 
+    -- Older versions replaced Entity:SetCollisionBounds globally and silently
+    -- discarded calls made by NPC/NextBot addons while PMAV managed an entity.
+    -- Restore the original method on hot reload and compose through the normal
+    -- engine API instead of owning a process-wide metatable function.
     local entityMeta = FindMetaTable("Entity")
 
-    if entityMeta and not AV.CollisionBoundsPatched then
-        AV.OriginalSetCollisionBounds = AV.OriginalSetCollisionBounds or entityMeta.SetCollisionBounds
-
-        function entityMeta:SetCollisionBounds(mins, maxs)
-            if not AV.InternalCollisionApply and IsValid(self) and self.pmavBlockExternalCollisionBounds then
-                return
-            end
-
-            return AV.OriginalSetCollisionBounds(self, mins, maxs)
-        end
-
-        AV.CollisionBoundsPatched = true
+    if entityMeta and AV.CollisionBoundsPatched and isfunction(AV.OriginalSetCollisionBounds) then
+        entityMeta.SetCollisionBounds = AV.OriginalSetCollisionBounds
     end
+
+    AV.CollisionBoundsPatched = false
 end
 
 local function IsSettingsEditAllowed(ply)
@@ -428,7 +424,10 @@ local function NearlyEqualVector(a, b, epsilon)
 end
 
 local function BroadcastBounds(ent, mins, maxs, duckMins, duckMaxs)
-    if not IsDebugBoundsAllowed() then
+    local debugAllowed = IsDebugBoundsAllowed()
+    local ownerNeedsPrediction = IsValid(ent) and ent:IsPlayer() and not ent:IsBot()
+
+    if not debugAllowed and not ownerNeedsPrediction then
         return
     end
 
@@ -443,7 +442,14 @@ local function BroadcastBounds(ent, mins, maxs, duckMins, duckMaxs)
         net.WriteVector(duckMaxs)
     end
 
-    net.Broadcast()
+    if debugAllowed then
+        net.Broadcast()
+    else
+        -- SetHull/SetHullDuck are not replicated by the engine. The owning
+        -- client must receive the exact server hulls or its predicted air-duck
+        -- origin shift will disagree and visibly snap the camera.
+        net.Send(ent)
+    end
 end
 
 local function SetPlayerHullStable(ply, mins, maxs, duckMins, duckMaxs)
@@ -531,11 +537,7 @@ local function SetEntityCollisionBoundsStable(ent, mins, maxs)
     ent.pmavLastBoundsMaxs = Vector(maxs.x, maxs.y, maxs.z)
     ent.pmavAdaptiveBoundsApplied = true
     ent.pmavAdaptiveBoundsAppliedAt = CurTime()
-    ent.pmavBlockExternalCollisionBounds = true
-
-    AV.InternalCollisionApply = true
     ent:SetCollisionBounds(mins, maxs)
-    AV.InternalCollisionApply = false
 
     BroadcastBounds(ent, mins, maxs)
 end
@@ -962,7 +964,8 @@ local function SmoothPinnedHeadDelta(ply, rawDelta, smooth)
     ply.pmavPinLastOriginZ = posZ
     local onGround = isfunction(ply.IsOnGround) and ply:IsOnGround()
     local speed2D = isfunction(ply.GetVelocity) and ply:GetVelocity():Length2D() or 0
-    local crouching = isfunction(ply.Crouching) and ply:Crouching()
+    local ducking = (isfunction(ply.KeyDown) and ply:KeyDown(IN_DUCK)) or
+        (isfunction(ply.Crouching) and ply:Crouching())
     local frameStep = math.max(FrameTime(), engine.TickInterval and engine.TickInterval() or 0.015)
     local currentDelta = ply.pmavPinSmoothedHeadDelta
 
@@ -974,7 +977,7 @@ local function SmoothPinnedHeadDelta(ply, rawDelta, smooth)
 
     local targetDelta = rawDelta
 
-    if crouching then
+    if ducking then
         targetDelta = currentDelta
     end
 
@@ -1095,7 +1098,8 @@ local function GetPlayerMassAndPickupLimit(ply, settings, rule)
 end
 
 local function GetTargetHeights(ply, settings)
-    local rule = GetRule(settings, GetPlayerRuleModel(ply, settings))
+    local ruleModel = GetPlayerRuleModel(ply, settings)
+    local rule = GetRule(settings, ruleModel)
 
     if not settings.enabled or rule and rule.mode == "off" then
         return nil
@@ -1106,7 +1110,15 @@ local function GetTargetHeights(ply, settings)
     local standHeight = rule and rule.mode == "height" and rule.height * scale or GetModelAutoHeight(ply, settings)
     standHeight = standHeight + cameraVerticalOffset
 
-    local mins, maxs = ply:GetModelBounds()
+    local mins, maxs
+
+    if ruleModel ~= NormalizeModel(ply:GetModel()) and isfunction(util.GetModelBounds) then
+        mins, maxs = util.GetModelBounds(ruleModel)
+    end
+
+    if not mins or not maxs then
+        mins, maxs = ply:GetModelBounds()
+    end
     mins = mins or Vector(0, 0, 0)
     maxs = maxs or Vector(16, 16, 72)
     mins, maxs = ScaleBounds(mins, maxs, scale)
@@ -1252,6 +1264,7 @@ AV.PlayerSettings = AV.PlayerSettings or {}
 AV.PlayerEnabledOverride = AV.PlayerEnabledOverride or {}
 AV.SharedSettings = AV.SharedSettings or SanitizeSettings({})
 AV.ManagedEntities = AV.ManagedEntities or {}
+AV.PendingEntities = AV.PendingEntities or {}
 
 local function CopySettingsForWorld(settings)
     local copied = table.Copy(settings or AV.SharedSettings or SanitizeSettings({}))
@@ -1325,6 +1338,93 @@ local function CaptureDefaults(ply)
     if isfunction(ply.GetJumpPower) then
         ply.pmavDefaultJumpPower = ply:GetJumpPower()
     end
+
+    if isfunction(ply.SetNW2Vector) then
+        ply:SetNW2Vector("pmav_default_stand", ply.pmavDefaultStand)
+        ply:SetNW2Vector("pmav_default_duck", ply.pmavDefaultDuck)
+    end
+end
+
+local function CopyVector(value, fallback)
+    value = value or fallback or vector_origin
+    return Vector(value.x, value.y, value.z)
+end
+
+-- Refresh only values which no longer match the last value written by PMAV.
+-- This lets jobs, player classes and movement addons change their baseline
+-- after spawn without accidentally teaching PMAV that its own adaptive values
+-- are the new defaults.
+local function RefreshExternalPlayerDefaults(ply)
+    if not IsValid(ply) then
+        return
+    end
+
+    if not ply.pmavDefaultsCaptured then
+        CaptureDefaults(ply)
+        return
+    end
+
+    local stand = ply:GetViewOffset()
+    local duck = ply:GetViewOffsetDucked()
+
+    if not ply.pmavLastStandOffset or not NearlyEqualVector(stand, ply.pmavLastStandOffset) then
+        ply.pmavDefaultStand = CopyVector(stand, Vector(0, 0, 64))
+    end
+
+    if not ply.pmavLastDuckOffset or not NearlyEqualVector(duck, ply.pmavLastDuckOffset) then
+        ply.pmavDefaultDuck = CopyVector(duck, Vector(0, 0, 28))
+    end
+
+    local hullMins, hullMaxs = ply:GetHull()
+    local duckMins, duckMaxs = ply:GetHullDuck()
+
+    if not ply.pmavLastHullMins or not NearlyEqualVector(hullMins, ply.pmavLastHullMins) or not NearlyEqualVector(hullMaxs, ply.pmavLastHullMaxs) then
+        ply.pmavDefaultHullMins = CopyVector(hullMins, Vector(-16, -16, 0))
+        ply.pmavDefaultHullMaxs = CopyVector(hullMaxs, Vector(16, 16, 72))
+    end
+
+    if not ply.pmavLastDuckMins or not NearlyEqualVector(duckMins, ply.pmavLastDuckMins) or not NearlyEqualVector(duckMaxs, ply.pmavLastDuckMaxs) then
+        ply.pmavDefaultDuckMins = CopyVector(duckMins, Vector(-16, -16, 0))
+        ply.pmavDefaultDuckMaxs = CopyVector(duckMaxs, Vector(16, 16, 36))
+    end
+
+    local walkSpeed = isfunction(ply.GetWalkSpeed) and ply:GetWalkSpeed()
+    local runSpeed = isfunction(ply.GetRunSpeed) and ply:GetRunSpeed()
+    local jumpPower = isfunction(ply.GetJumpPower) and ply:GetJumpPower()
+
+    if walkSpeed and (ply.pmavLastWrittenWalkSpeed == nil or math.abs(walkSpeed - ply.pmavLastWrittenWalkSpeed) > 0.001) then
+        ply.pmavDefaultWalkSpeed = walkSpeed
+    end
+
+    if runSpeed and (ply.pmavLastWrittenRunSpeed == nil or math.abs(runSpeed - ply.pmavLastWrittenRunSpeed) > 0.001) then
+        ply.pmavDefaultRunSpeed = runSpeed
+    end
+
+    if jumpPower and (ply.pmavLastWrittenJumpPower == nil or math.abs(jumpPower - ply.pmavLastWrittenJumpPower) > 0.001) then
+        ply.pmavDefaultJumpPower = jumpPower
+    end
+
+    if isfunction(ply.SetNW2Vector) then
+        ply:SetNW2Vector("pmav_default_stand", ply.pmavDefaultStand)
+        ply:SetNW2Vector("pmav_default_duck", ply.pmavDefaultDuck)
+    end
+end
+
+local function SetPlayerMovementValues(ply, walkSpeed, runSpeed, jumpPower)
+    if walkSpeed ~= nil and isfunction(ply.SetWalkSpeed) then
+        ply:SetWalkSpeed(walkSpeed)
+        ply.pmavLastWrittenWalkSpeed = walkSpeed
+    end
+
+    if runSpeed ~= nil and isfunction(ply.SetRunSpeed) then
+        ply:SetRunSpeed(runSpeed)
+        ply.pmavLastWrittenRunSpeed = runSpeed
+    end
+
+    if jumpPower ~= nil and isfunction(ply.SetJumpPower) then
+        ply:SetJumpPower(jumpPower)
+        ply.pmavLastWrittenJumpPower = jumpPower
+    end
 end
 
 local function RestorePlayer(ply, forceEngineDefaults)
@@ -1336,16 +1436,15 @@ local function RestorePlayer(ply, forceEngineDefaults)
         return
     end
 
-    local stand = forceEngineDefaults and Vector(0, 0, 64) or ply.pmavDefaultStand
-    local duck = forceEngineDefaults and Vector(0, 0, 28) or ply.pmavDefaultDuck
-    local hullMins = forceEngineDefaults and Vector(-16, -16, 0) or ply.pmavDefaultHullMins
-    local hullMaxs = forceEngineDefaults and Vector(16, 16, 72) or ply.pmavDefaultHullMaxs
-    local duckMins = forceEngineDefaults and Vector(-16, -16, 0) or ply.pmavDefaultDuckMins
-    local duckMaxs = forceEngineDefaults and Vector(16, 16, 36) or ply.pmavDefaultDuckMaxs
+    local stand = ply.pmavDefaultStand or Vector(0, 0, 64)
+    local duck = ply.pmavDefaultDuck or Vector(0, 0, 28)
+    local hullMins = ply.pmavDefaultHullMins or Vector(-16, -16, 0)
+    local hullMaxs = ply.pmavDefaultHullMaxs or Vector(16, 16, 72)
+    local duckMins = ply.pmavDefaultDuckMins or Vector(-16, -16, 0)
+    local duckMaxs = ply.pmavDefaultDuckMaxs or Vector(16, 16, 36)
 
-    -- Hard-off path: if the addon was hot-reloaded while active, the captured
-    -- defaults can already be adaptive. The Enable add-on checkbox must still
-    -- fully detach from camera/hull logic.
+    -- Never replace a gamemode/job baseline with Sandbox constants merely
+    -- because the user disabled PMAV. Engine defaults are fallback-only.
     SetPlayerViewOffsetsStable(ply, stand, duck)
     SetPlayerHullStable(ply, hullMins, hullMaxs, duckMins, duckMaxs)
     ply.pmavCurrentStandHeight = nil
@@ -1353,17 +1452,12 @@ local function RestorePlayer(ply, forceEngineDefaults)
     ply.pmavCurrentCameraOffsetX = nil
     ply.pmavCurrentCameraOffsetY = nil
 
-    if isfunction(ply.SetWalkSpeed) then
-        ply:SetWalkSpeed(forceEngineDefaults and 200 or ply.pmavDefaultWalkSpeed or 200)
-    end
-
-    if isfunction(ply.SetRunSpeed) then
-        ply:SetRunSpeed(forceEngineDefaults and 400 or ply.pmavDefaultRunSpeed or 400)
-    end
-
-    if isfunction(ply.SetJumpPower) then
-        ply:SetJumpPower(forceEngineDefaults and 200 or ply.pmavDefaultJumpPower or 200)
-    end
+    SetPlayerMovementValues(
+        ply,
+        ply.pmavDefaultWalkSpeed or 200,
+        ply.pmavDefaultRunSpeed or 400,
+        ply.pmavDefaultJumpPower or 200
+    )
 
     ply.pmavMovementScale = 1
     ply.pmavJumpScale = 1
@@ -1404,17 +1498,7 @@ local function ShouldApplyMovementScale(ruleValue, autoEnabled)
 end
 
 local function RestoreAppliedMovementScale(ply)
-    if ply.pmavDefaultWalkSpeed and isfunction(ply.SetWalkSpeed) then
-        ply:SetWalkSpeed(ply.pmavDefaultWalkSpeed)
-    end
-
-    if ply.pmavDefaultRunSpeed and isfunction(ply.SetRunSpeed) then
-        ply:SetRunSpeed(ply.pmavDefaultRunSpeed)
-    end
-
-    if ply.pmavDefaultJumpPower and isfunction(ply.SetJumpPower) then
-        ply:SetJumpPower(ply.pmavDefaultJumpPower)
-    end
+    SetPlayerMovementValues(ply, ply.pmavDefaultWalkSpeed, ply.pmavDefaultRunSpeed, ply.pmavDefaultJumpPower)
 
     ply.pmavMovementScale = 1
     ply.pmavJumpScale = 1
@@ -1439,33 +1523,26 @@ local function ApplyPlayerMovementScale(ply, settings, hullHeight, rule)
     ply.pmavJumpScale = jumpScale
 
     if ShouldApplyMovementScale(rule and rule.speed, settings.adaptiveSpeed) then
-        if ply.pmavDefaultWalkSpeed and isfunction(ply.SetWalkSpeed) then
-            ply:SetWalkSpeed(math.max(math.Round(ply.pmavDefaultWalkSpeed * speedScale), 0))
-        end
-
-        if ply.pmavDefaultRunSpeed and isfunction(ply.SetRunSpeed) then
-            ply:SetRunSpeed(math.max(math.Round(ply.pmavDefaultRunSpeed * speedScale), 0))
-        end
+        SetPlayerMovementValues(
+            ply,
+            ply.pmavDefaultWalkSpeed and math.max(math.Round(ply.pmavDefaultWalkSpeed * speedScale), 0),
+            ply.pmavDefaultRunSpeed and math.max(math.Round(ply.pmavDefaultRunSpeed * speedScale), 0),
+            nil
+        )
         ply.pmavAppliedSpeed = true
     else
-        if ply.pmavAppliedSpeed and ply.pmavDefaultWalkSpeed and isfunction(ply.SetWalkSpeed) then
-            ply:SetWalkSpeed(ply.pmavDefaultWalkSpeed)
-        end
-
-        if ply.pmavAppliedSpeed and ply.pmavDefaultRunSpeed and isfunction(ply.SetRunSpeed) then
-            ply:SetRunSpeed(ply.pmavDefaultRunSpeed)
+        if ply.pmavAppliedSpeed then
+            SetPlayerMovementValues(ply, ply.pmavDefaultWalkSpeed, ply.pmavDefaultRunSpeed, nil)
         end
 
         ply.pmavAppliedSpeed = false
     end
 
     if ShouldApplyMovementScale(rule and rule.jump, settings.adaptiveJump) then
-        if ply.pmavDefaultJumpPower and isfunction(ply.SetJumpPower) then
-            ply:SetJumpPower(math.max(math.Round(ply.pmavDefaultJumpPower * jumpScale), 0))
-        end
+        SetPlayerMovementValues(ply, nil, nil, ply.pmavDefaultJumpPower and math.max(math.Round(ply.pmavDefaultJumpPower * jumpScale), 0))
         ply.pmavAppliedJump = true
-    elseif ply.pmavAppliedJump and ply.pmavDefaultJumpPower and isfunction(ply.SetJumpPower) then
-        ply:SetJumpPower(ply.pmavDefaultJumpPower)
+    elseif ply.pmavAppliedJump and ply.pmavDefaultJumpPower then
+        SetPlayerMovementValues(ply, nil, nil, ply.pmavDefaultJumpPower)
         ply.pmavAppliedJump = false
     end
 end
@@ -2091,7 +2168,6 @@ local function RestoreEntity(ent)
         return
     end
 
-    ent.pmavBlockExternalCollisionBounds = false
     ent.pmavAdaptiveBoundsApplied = false
     ent.pmavAdaptiveBoundsAppliedAt = nil
     ent.pmavLastBulletHitPos = nil
@@ -2107,10 +2183,32 @@ local function RestoreEntity(ent)
     ent.pmavLastBoundsMins = Vector(ent.pmavDefaultCollisionMins.x, ent.pmavDefaultCollisionMins.y, ent.pmavDefaultCollisionMins.z)
     ent.pmavLastBoundsMaxs = Vector(ent.pmavDefaultCollisionMaxs.x, ent.pmavDefaultCollisionMaxs.y, ent.pmavDefaultCollisionMaxs.z)
 
-    AV.InternalCollisionApply = true
     ent:SetCollisionBounds(ent.pmavDefaultCollisionMins, ent.pmavDefaultCollisionMaxs)
-    AV.InternalCollisionApply = false
     BroadcastBounds(ent, ent.pmavDefaultCollisionMins, ent.pmavDefaultCollisionMaxs)
+end
+
+local function YieldToExternalEntityBounds(ent)
+    if not IsValid(ent) or not ent.pmavAdaptiveBoundsApplied or not ent.pmavLastBoundsMins or not ent.pmavLastBoundsMaxs then
+        return false
+    end
+
+    local actualMins, actualMaxs = ent:GetCollisionBounds()
+
+    if NearlyEqualVector(actualMins, ent.pmavLastBoundsMins) and NearlyEqualVector(actualMaxs, ent.pmavLastBoundsMaxs) then
+        return false
+    end
+
+    -- Another addon intentionally changed the hull after PMAV. Treat that as
+    -- the new owner/default instead of overwriting it on the next settings pass.
+    ent.pmavDefaultCollisionMins = CopyVector(actualMins)
+    ent.pmavDefaultCollisionMaxs = CopyVector(actualMaxs)
+    ent.pmavLastBoundsMins = CopyVector(actualMins)
+    ent.pmavLastBoundsMaxs = CopyVector(actualMaxs)
+    ent.pmavBoundsCaptured = true
+    ent.pmavAdaptiveBoundsApplied = false
+    ent.pmavAdaptiveBoundsAppliedAt = nil
+    ent.pmavExternalBoundsOwned = true
+    return true
 end
 
 local function ApplyEntity(ent)
@@ -2123,12 +2221,21 @@ local function ApplyEntity(ent)
 
     local model = NormalizeModel(ent:GetModel())
 
+    if ent.pmavLastAppliedModel == model and ent.pmavExternalBoundsOwned then
+        return
+    end
+
+    if ent.pmavLastAppliedModel == model and YieldToExternalEntityBounds(ent) then
+        return
+    end
+
     if ent.pmavLastAppliedModel ~= nil and ent.pmavLastAppliedModel ~= model then
         ent.pmavBoundsCaptured = nil
         ent.pmavDefaultCollisionMins = nil
         ent.pmavDefaultCollisionMaxs = nil
         ent.pmavLastBoundsMins = nil
         ent.pmavLastBoundsMaxs = nil
+        ent.pmavExternalBoundsOwned = nil
     end
 
     ent.pmavLastAppliedModel = model
@@ -2173,13 +2280,11 @@ local function ApplyEntity(ent)
 end
 
 local function ScheduleEntityApply(ent)
-    timer.Simple(1, function()
-        if AV.Generation ~= GENERATION then
-            return
-        end
-
-        ApplyEntity(ent)
-    end)
+    if IsValid(ent) then
+        -- One shared queue replaces one anonymous timer per created entity.
+        -- Busy servers can create hundreds of props/projectiles in a second.
+        AV.PendingEntities[ent] = CurTime() + 1
+    end
 end
 
 local function ScheduleAllEntitiesApply()
@@ -2219,23 +2324,13 @@ local function GetWorldSettingsSignature(settings)
         ruleParts[#ruleParts + 1] = table.concat({
             NormalizeModel(model),
             tostring(rule.mode or ""),
-            tostring(math.Round(NumberOr(rule.height, 0), 3)),
-            tostring(math.Round(NumberOr(rule.offset, 0), 3)),
-            tostring(math.Round(NumberOr(rule.cameraOffset, 0), 3)),
-            tostring(math.Round(NumberOr(rule.duckCameraHeight, 0), 3)),
             tostring(math.Round(NumberOr(rule.collisionHeight, 0), 3)),
             tostring(math.Round(NumberOr(rule.collisionWidth, 0), 3)),
             tostring(math.Round(NumberOr(rule.collisionLength, 0), 3)),
             tostring(math.Round(NumberOr(rule.collisionMinX, 0), 3)),
             tostring(math.Round(NumberOr(rule.collisionMaxX, 0), 3)),
             tostring(math.Round(NumberOr(rule.collisionMinY, 0), 3)),
-            tostring(math.Round(NumberOr(rule.collisionMaxY, 0), 3)),
-            tostring(math.Round(NumberOr(rule.cameraOffsetX, 0), 3)),
-            tostring(math.Round(NumberOr(rule.cameraOffsetY, 0), 3)),
-            rule.pinCameraOnEye and "1" or "0",
-            tostring(math.Round(NumberOr(rule.pinEyeSmoothing, 0), 3)),
-            tostring(math.Round(NumberOr(rule.speed, -1), 3)),
-            tostring(math.Round(NumberOr(rule.jump, -1), 3))
+            tostring(math.Round(NumberOr(rule.collisionMaxY, 0), 3))
         }, ":")
     end
 
@@ -2245,18 +2340,10 @@ local function GetWorldSettingsSignature(settings)
         tostring(settings.collisionMode or 0),
         settings.collisionOnlyPlayers and "1" or "0",
         settings.npcCollision and "1" or "0",
-        settings.adaptiveSpeed and "1" or "0",
-        settings.adaptiveJump and "1" or "0",
-        settings.adaptivePickupWeight and "1" or "0",
         tostring(settings.autoScale or 0),
-        tostring(settings.globalOffset or 0),
-        tostring(settings.cameraFov or 0),
-        tostring(settings.cameraOffsetX or 0),
-        tostring(settings.cameraOffsetY or 0),
         settings.scaleSupport and "1" or "0",
         tostring(settings.scaleMin or 0),
         tostring(settings.scaleMax or 0),
-        tostring(settings.minHeight or 0),
         tostring(settings.maxHeight or 0),
         table.concat(ruleParts, ",")
     }, "|")
@@ -2328,6 +2415,7 @@ net.Receive(NET_SETTINGS, function(_, ply)
     end
 
     CaptureDefaults(ply)
+    RefreshExternalPlayerDefaults(ply)
 
     local oldSettings = AV.PlayerSettings[ply]
     local oldRule = oldSettings and GetRule(oldSettings, GetPlayerRuleModel(ply, oldSettings))
@@ -2336,15 +2424,19 @@ net.Receive(NET_SETTINGS, function(_, ply)
     AV.PlayerSettings[ply] = SanitizeSettings(incomingSettings)
     local settings = AV.PlayerSettings[ply]
 
+    if AV.GlobalDisableActive then
+        if not ply.pmavHadEnabledBeforeGlobalDisable then
+            ply.pmavHadEnabledBeforeGlobalDisable = true
+            ply.pmavEnabledBeforeGlobalDisable = settings.enabled
+            ply.pmavHadOverrideBeforeGlobalDisable = AV.PlayerEnabledOverride[ply] ~= nil
+            ply.pmavOverrideBeforeGlobalDisable = AV.PlayerEnabledOverride[ply]
+        end
+
+        AV.PlayerEnabledOverride[ply] = false
+    end
+
     if AV.PlayerEnabledOverride[ply] ~= nil then
         settings.enabled = AV.PlayerEnabledOverride[ply]
-
-        if not settings.enabled then
-            settings.collision = false
-            settings.npcCollision = false
-            settings.adaptiveSpeed = false
-            settings.adaptiveJump = false
-        end
     end
 
     local oldWorldSignature = AV.WorldSettingsSignature
@@ -2415,17 +2507,17 @@ concommand.Add("pmav_set_enabled", function(ply, _, args)
 
     local enabled = tostring(args and args[1] or "1") ~= "0"
 
+    if IsValid(ply) and AV.GlobalDisableActive then
+        enabled = false
+    end
+
     if IsValid(ply) then
         AV.PlayerEnabledOverride[ply] = enabled
         CaptureDefaults(ply)
+        RefreshExternalPlayerDefaults(ply)
 
         local settings = SanitizeSettings(AV.PlayerSettings[ply] or CopySettingsForWorld(AV.SharedSettings))
         settings.enabled = enabled
-        settings.collision = enabled and settings.collision or false
-        settings.npcCollision = enabled and settings.npcCollision or false
-        settings.adaptiveSpeed = enabled and settings.adaptiveSpeed or false
-        settings.adaptiveJump = enabled and settings.adaptiveJump or false
-        settings.adaptivePickupWeight = enabled and settings.adaptivePickupWeight or false
 
         AV.PlayerSettings[ply] = settings
         AV.SharedSettings = CopySettingsForWorld(settings)
@@ -2439,14 +2531,70 @@ concommand.Add("pmav_set_enabled", function(ply, _, args)
             RestorePlayer(ply, true)
         end
     else
-        local settings = SanitizeSettings(AV.SharedSettings or {})
+        local wasGloballyDisabled = AV.GlobalDisableActive == true
+
+        if not enabled and not wasGloballyDisabled then
+            AV.SharedSettingsBeforeGlobalDisable = table.Copy(AV.SharedSettings or {})
+        end
+
+        local settings = enabled and AV.SharedSettingsBeforeGlobalDisable and
+            SanitizeSettings(AV.SharedSettingsBeforeGlobalDisable) or
+            SanitizeSettings(AV.SharedSettings or {})
         settings.enabled = enabled
-        settings.collision = enabled and settings.collision or false
-        settings.npcCollision = enabled and settings.npcCollision or false
-        settings.adaptiveSpeed = enabled and settings.adaptiveSpeed or false
-        settings.adaptiveJump = enabled and settings.adaptiveJump or false
-        settings.adaptivePickupWeight = enabled and settings.adaptivePickupWeight or false
         AV.SharedSettings = CopySettingsForWorld(settings)
+        AV.GlobalDisableActive = not enabled
+
+        -- A dedicated-server console command is a global administrative gate,
+        -- not merely a change to defaults for future players. Apply it to every
+        -- connected player, including those with an existing personal payload.
+        for _, target in ipairs(player.GetAll()) do
+            CaptureDefaults(target)
+            RefreshExternalPlayerDefaults(target)
+
+            local targetSettings = SanitizeSettings(AV.PlayerSettings[target] or CopySettingsForWorld(AV.SharedSettings))
+
+            if not enabled then
+                if not wasGloballyDisabled then
+                    target.pmavHadEnabledBeforeGlobalDisable = true
+                    target.pmavEnabledBeforeGlobalDisable = targetSettings.enabled
+                    target.pmavHadOverrideBeforeGlobalDisable = AV.PlayerEnabledOverride[target] ~= nil
+                    target.pmavOverrideBeforeGlobalDisable = AV.PlayerEnabledOverride[target]
+                end
+
+                AV.PlayerEnabledOverride[target] = false
+                targetSettings.enabled = false
+            else
+                if target.pmavHadOverrideBeforeGlobalDisable then
+                    AV.PlayerEnabledOverride[target] = target.pmavOverrideBeforeGlobalDisable
+                else
+                    AV.PlayerEnabledOverride[target] = nil
+                end
+
+                if target.pmavHadEnabledBeforeGlobalDisable then
+                    targetSettings.enabled = target.pmavEnabledBeforeGlobalDisable == true
+                else
+                    targetSettings.enabled = settings.enabled
+                end
+
+                target.pmavHadEnabledBeforeGlobalDisable = nil
+                target.pmavEnabledBeforeGlobalDisable = nil
+                target.pmavHadOverrideBeforeGlobalDisable = nil
+                target.pmavOverrideBeforeGlobalDisable = nil
+            end
+
+            AV.PlayerSettings[target] = targetSettings
+            timer.Remove("pmav_smooth_" .. target:EntIndex())
+
+            if targetSettings.enabled then
+                ApplyPlayer(target)
+            else
+                RestorePlayer(target, true)
+            end
+        end
+
+        if enabled then
+            AV.SharedSettingsBeforeGlobalDisable = nil
+        end
     end
 
     ScheduleAllEntitiesApply()
@@ -2459,12 +2607,24 @@ end)
 
 hook.Add("EntityRemoved", "pm_eblansky_adaptive_view_entities", function(ent)
     AV.ManagedEntities[ent] = nil
+    AV.PendingEntities[ent] = nil
 end)
 
 timer.Create("pm_eblansky_adaptive_view_entity_model_watch", 1, 0, function()
     if AV.Generation ~= GENERATION then
         timer.Remove("pm_eblansky_adaptive_view_entity_model_watch")
         return
+    end
+
+    local now = CurTime()
+
+    for ent, readyAt in pairs(AV.PendingEntities) do
+        if not IsValid(ent) then
+            AV.PendingEntities[ent] = nil
+        elseif readyAt <= now then
+            AV.PendingEntities[ent] = nil
+            ApplyEntity(ent)
+        end
     end
 
     for ent in pairs(AV.ManagedEntities) do
@@ -2493,6 +2653,7 @@ hook.Add("PlayerSpawn", "pm_eblansky_adaptive_view", function(ply)
             return
         end
 
+        RefreshExternalPlayerDefaults(ply)
         ApplyPlayer(ply)
     end)
 
@@ -2501,6 +2662,7 @@ hook.Add("PlayerSpawn", "pm_eblansky_adaptive_view", function(ply)
             return
         end
 
+        RefreshExternalPlayerDefaults(ply)
         ApplyPlayer(ply)
     end)
 
@@ -2509,6 +2671,7 @@ hook.Add("PlayerSpawn", "pm_eblansky_adaptive_view", function(ply)
             return
         end
 
+        RefreshExternalPlayerDefaults(ply)
         ApplyPlayer(ply)
     end)
 end)
@@ -2522,6 +2685,7 @@ hook.Add("PlayerSetModel", "pm_eblansky_adaptive_view", function(ply)
             return
         end
 
+        RefreshExternalPlayerDefaults(ply)
         ApplyPlayer(ply)
     end)
 
@@ -2530,6 +2694,7 @@ hook.Add("PlayerSetModel", "pm_eblansky_adaptive_view", function(ply)
             return
         end
 
+        RefreshExternalPlayerDefaults(ply)
         ApplyPlayer(ply)
     end)
 
@@ -2538,6 +2703,7 @@ hook.Add("PlayerSetModel", "pm_eblansky_adaptive_view", function(ply)
             return
         end
 
+        RefreshExternalPlayerDefaults(ply)
         ApplyPlayer(ply)
     end)
 end)

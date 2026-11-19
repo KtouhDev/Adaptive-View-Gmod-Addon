@@ -764,8 +764,8 @@ local function SmoothPinnedHeadDelta(ply, rawDelta, smooth)
     ply.pmavPinLastOriginZ = posZ
     local onGround = isfunction(ply.IsOnGround) and ply:IsOnGround()
     local speed2D = isfunction(ply.GetVelocity) and ply:GetVelocity():Length2D() or 0
-    local crouching = isfunction(ply.Crouching) and ply:Crouching()
-    local ikFootActive = IsIKFootActive(ply)
+    local ducking = (isfunction(ply.KeyDown) and ply:KeyDown(IN_DUCK)) or
+        (isfunction(ply.Crouching) and ply:Crouching())
     local frameStep = math.max(FrameTime(), engine.TickInterval and engine.TickInterval() or 0.015)
     local currentDelta = ply.pmavPinSmoothedHeadDelta
 
@@ -777,7 +777,9 @@ local function SmoothPinnedHeadDelta(ply, rawDelta, smooth)
 
     local targetDelta = rawDelta
 
-    if crouching or (ikFootActive and onGround) then
+    -- Keep this identical to the server stabilizer. A client-only IK Foot
+    -- branch made predicted view offsets disagree with the authoritative ones.
+    if ducking then
         targetDelta = currentDelta
     end
 
@@ -854,21 +856,25 @@ local function GetTargetHeight(ply, duckAmount)
     standingHeight = standingHeight + cvGlobalOffset:GetFloat() + (rule and rule.cameraOffset or rule and rule.offset or 0)
 
     local tacMove = GetConVar("vb_movement")
-    local duckRatio = 0.4375
+    local defaultStand = isfunction(ply.GetNW2Vector) and ply:GetNW2Vector("pmav_default_stand", Vector(0, 0, 64)) or Vector(0, 0, 64)
+    local defaultDuck = isfunction(ply.GetNW2Vector) and ply:GetNW2Vector("pmav_default_duck", Vector(0, 0, 28)) or Vector(0, 0, 28)
+    local duckRatio = defaultStand.z ~= 0 and defaultDuck.z / defaultStand.z or 0.4375
 
-    if not tacMove or not tacMove:GetBool() then
-        local baseStand = ply:GetViewOffset().z
-        local baseDuck = ply:GetViewOffsetDucked().z
-        duckRatio = baseStand ~= 0 and baseDuck / baseStand or duckRatio
+    if tacMove and tacMove:GetBool() then
+        duckRatio = 28 / 64
     end
+
+    local modelMins = isfunction(util.GetModelBounds) and util.GetModelBounds(GetAdaptiveLookupModel(ply)) or vector_origin
+    local modelScale = GetLocalAdaptiveModelScale(ply)
+    local footSafeHeight = math.max(NumberOr(modelMins and modelMins.z, 0) * modelScale + 8, 4)
 
     local duckHeight
 
     if rule and rule.duckCameraHeight and rule.duckCameraHeight > 0 then
         duckHeight = rule.duckCameraHeight * GetLocalAdaptiveModelScale(ply) + cvGlobalOffset:GetFloat() + (rule.cameraOffset or rule.offset or 0)
-        duckHeight = math.Clamp(duckHeight, 18, standingHeight)
+        duckHeight = math.Clamp(duckHeight, footSafeHeight, standingHeight)
     else
-        duckHeight = math.max(standingHeight * duckRatio, 18)
+        duckHeight = math.max(standingHeight * duckRatio, footSafeHeight)
     end
 
     return Lerp(duckAmount, standingHeight, duckHeight)
@@ -937,8 +943,10 @@ hook.Add("FinishMove", "pm_eblansky_adaptive_view_tacmove_camera", function(ply)
         ply.pmavPinLiveDuckHeight = nil
     end
 
-    ply:SetViewOffset(Vector(0, 0, standHeight))
-    ply:SetViewOffsetDucked(Vector(0, 0, duckHeight))
+    local defaultStand = isfunction(ply.GetNW2Vector) and ply:GetNW2Vector("pmav_default_stand", ply:GetViewOffset()) or ply:GetViewOffset()
+    local defaultDuck = isfunction(ply.GetNW2Vector) and ply:GetNW2Vector("pmav_default_duck", ply:GetViewOffsetDucked()) or ply:GetViewOffsetDucked()
+    ply:SetViewOffset(Vector(defaultStand.x, defaultStand.y, standHeight))
+    ply:SetViewOffsetDucked(Vector(defaultDuck.x, defaultDuck.y, duckHeight))
 end)
 
 local function GetLocalCameraPlaneOffset()
@@ -5192,6 +5200,18 @@ net.Receive("pmav_bounds", function()
     end
 
     if IsValid(ent) then
+        if ent == LocalPlayer() then
+            -- Player hull sizes are not networked automatically by Garry's Mod.
+            -- Mirror the authoritative server values for movement prediction;
+            -- otherwise FinishDuck uses different hull deltas in each realm and
+            -- the first-person camera jumps when crouching in mid-air.
+            ent:SetHull(mins, maxs)
+
+            if duckMins and duckMaxs then
+                ent:SetHullDuck(duckMins, duckMaxs)
+            end
+        end
+
         AV.ServerBounds[ent] = {
             mins = mins,
             maxs = maxs,

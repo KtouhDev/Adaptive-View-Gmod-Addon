@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-11-19
+
+- Fixed `pmav_set_enabled 0` replacing custom gamemode/darkrp_job walk speed, run speed, jump power, view offsets, and hulls with Sandbox defaults.
+- Adaptive View now refreshes player baselines after spawn and model/class changes, so later changes made by jobs and movement addons are preserved;
+- Removed the global `Entity:SetCollisionBounds` override that blocked collision changes made by other addons; externally owned entity bounds now take priority.
+- Preserved non-zero view-offset X/Y values instead of forcing them to zero in the predicted camera path.
+- Synchronized client/server crouch-height, model-bound, TacMove, Outfitter, and pinned-eye calculations to prevent camera jumps while crouching in the air.
+- Fixed dedicated-server `pmav_set_enabled` changes not applying to already connected players.
+- Enabling the addon again no longer loses the player's collision, movement, jump, or pickup settings.
+- Replaced per-entity delayed timers with one shared queue and limited full world rescans to collision-relevant seting changes.
+
+## 2026-11-15
+
+- Fixed the camera snapping upward when crouching in mid-air by synchronizing adaptive standing and duck hulls to the owning client for movement prediction.
+- Garry's Mod does not replicate `SetHull` or `SetHullDuck` automatically; Adaptive View now sends the authoritative server bounds to the local player and applies them clientside.
+- Fixed pinned-eye camera jitter during crouch transitions.
+- Pinned-eye stabilization now freezes head-pose tracking from the first `IN_DUCK` input instead of waiting for `Crouching()` to become true.
+- Kept the client and server stabilization paths in sync throughout crouch and uncrouch transitions.
+
 ## 2026-10-10
 
 - Fixed aiming compatibility with ArcCW, TacRP, and other weapon bases by allowing their `CalcView` and  `CalcViewModelView` hooks to finish processing the adjusted camera positions

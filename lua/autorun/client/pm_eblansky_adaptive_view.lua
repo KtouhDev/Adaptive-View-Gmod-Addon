@@ -808,7 +808,7 @@ local function SmoothPinnedHeadDelta(ply, rawDelta, smooth)
         return currentDelta
     end
 
-    -- Hueglot pin stabilizer: fast enough to feel attached, but it eats head-bone bob and stair-step jitter.
+    -- Hueglot pin stabilizer: fast enough to feel attached, but it eats head-bone bob and stair-step jitter .
     local response = Lerp(smooth, 22, 4.5)
     local alpha = 1 - math.exp(-frameStep * response)
     local wantedDelta = Lerp(math.Clamp(alpha, 0, 1), currentDelta, targetDelta)

@@ -39,8 +39,6 @@ local SOURCE_UNIT_METERS = 0.01905
 local METERS_TO_FEET = 3.280839895
 local KG_TO_LB = 2.2046226218
 local MODERN_PROFILE_FOV = 35
--- Hueglot note: чмо блять хуй пенис пизда,
--- ало шлюхис грушич победитор поездатор.
 -- local MODERN_HULL_SERVER_VISUAL_BIAS = 2
 
 surface.CreateFont("PMAVModernGeneralTitle", {
